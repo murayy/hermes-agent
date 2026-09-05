@@ -62,7 +62,7 @@ import shutil
 import subprocess
 import sys
 import time
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from dataclasses import dataclass, field
 
 from html import escape as _html_escape
@@ -1792,10 +1792,21 @@ class MatrixAdapter(BasePlatformAdapter):
         chunks = self.truncate_message(formatted, self.max_message_length)
 
         last_event_id = None
+        effective_reply_to = reply_to
+        thread_id = str((metadata or {}).get("thread_id") or "")
+        if thread_id and not effective_reply_to:
+            effective_reply_to = await self._resolve_thread_reply_target(
+                chat_id,
+                thread_id,
+            )
         for i, chunk in enumerate(chunks):
             msg_content = self._build_text_message_content(chunk)
 
-            self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
+            self._apply_relation_metadata(
+                msg_content,
+                reply_to=effective_reply_to,
+                metadata=metadata,
+            )
 
             try:
                 event_id = await asyncio.wait_for(
@@ -1807,6 +1818,8 @@ class MatrixAdapter(BasePlatformAdapter):
                     timeout=45,
                 )
                 last_event_id = str(event_id)
+                if thread_id:
+                    effective_reply_to = last_event_id
                 logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
             except Exception as exc:
                 # On E2EE errors, retry after sharing keys.
@@ -1822,6 +1835,8 @@ class MatrixAdapter(BasePlatformAdapter):
                             timeout=45,
                         )
                         last_event_id = str(event_id)
+                        if thread_id:
+                            effective_reply_to = last_event_id
                         logger.info(
                             "Matrix: sent event %s to %s (after key share)",
                             last_event_id,
@@ -2534,7 +2549,18 @@ class MatrixAdapter(BasePlatformAdapter):
                     audio_metadata["waveform"] = waveform
                 msg_content["org.matrix.msc1767.audio"] = audio_metadata
 
-        self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
+        effective_reply_to = reply_to
+        thread_id = str((metadata or {}).get("thread_id") or "")
+        if thread_id and not effective_reply_to:
+            effective_reply_to = await self._resolve_thread_reply_target(
+                room_id,
+                thread_id,
+            )
+        self._apply_relation_metadata(
+            msg_content,
+            reply_to=effective_reply_to,
+            metadata=metadata,
+        )
 
         try:
             event_id = await self._client.send_message_event(
@@ -4400,6 +4426,58 @@ class MatrixAdapter(BasePlatformAdapter):
                 {"event_id": reply_to or thread_id},
             )
             msg_content["m.relates_to"] = relates_to
+
+    async def _resolve_thread_reply_target(
+        self,
+        room_id: str,
+        thread_id: str,
+    ) -> str:
+        """Return the newest event in a thread for reply fallback chaining.
+
+        Matrix thread events always relate to the thread root, while
+        ``m.in_reply_to`` should point at the message being continued. Proactive
+        sends do not have an inbound ``reply_to`` value, so resolve the latest
+        thread event from the homeserver. If the lookup is unavailable, the
+        root remains a valid protocol-level fallback.
+        """
+        if not self._client or not thread_id:
+            return thread_id
+
+        encoded_room = quote(room_id, safe="")
+        encoded_thread = quote(thread_id, safe="")
+        path = (
+            f"/_matrix/client/v1/rooms/{encoded_room}/relations/"
+            f"{encoded_thread}/m.thread/m.room.message"
+        )
+        get_method: Any
+        try:
+            from mautrix.api import Method as MatrixMethod
+
+            get_method = MatrixMethod.GET
+        except ImportError:
+            get_method = "GET"
+        try:
+            response = await asyncio.wait_for(
+                self._client.api.request(
+                    get_method,
+                    path,
+                    query_params={"dir": "b", "limit": "1"},
+                ),
+                timeout=10,
+            )
+            chunk = response.get("chunk", []) if isinstance(response, dict) else []
+            if chunk and isinstance(chunk[0], dict):
+                event_id = str(chunk[0].get("event_id") or "")
+                if event_id:
+                    return event_id
+        except Exception as exc:
+            logger.debug(
+                "Matrix: could not resolve latest event for thread %s in %s: %s",
+                thread_id,
+                room_id,
+                exc,
+            )
+        return thread_id
 
     def _extract_outbound_mentions(self, text: str) -> list[str]:
         """Return unique Matrix user IDs mentioned in outbound text."""
